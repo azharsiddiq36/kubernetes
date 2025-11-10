@@ -1,0 +1,2 @@
+# login
+kubectl vsphere login --server=10.65.20.2 --tanzu-kubernetes-cluster-name lab-smf-tanzu --tanzu-kubernetes-cluster-namespace tes-smf --vsphere-username mii_azhar@vsphere.local --insecure-skip-tls-verify

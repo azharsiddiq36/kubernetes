@@ -1,0 +1,166 @@
+variables:
+  REPO_URL: "repo.smf-indonesia.co.id/profil-risiko-likuiditas/backend.git"
+  REGISTRY: "registry.smf-indonesia.co.id"
+  OKD: "api.lab.smf-indonesia.co.id:6443"
+  OKD_PROJECT_DEV: "dev-likuiditas"
+  OKD_PROJECT_PROD: "prod-system-likuiditas"
+  IMAGE_NAME: "smf-likuiditas/backend"
+  DIRECTORY_NAME: "backend"
+  APPS_PROD: "likuiditas-backend"
+  APPS_DEV: "likuiditas-backend-dev"
+  GIT_SSL_NO_VERIFY: "true"
+  HOST_SONARQUBE: "http://10.66.30.203:9000/"
+  SONAR_PROJECT_KEY: "likuiditas-backend-dev"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+stages:
+  - determine-environment
+  - code-quality
+  - build
+  - deploy
+
+before_script:
+  - git config --global http.sslVerify false
+
+determine-environment:
+  stage: determine-environment
+  script:
+    - |
+      if [ "$CI_COMMIT_REF_NAME" = "develop" ]; then
+        echo "DEPLOY_ENV=development" >> build.env
+        echo "BRANCH_NAME=development" >> build.env
+        echo "IMAGE_TAG=development-$CI_PIPELINE_ID" >> build.env
+        echo "Deploying to development environment from branch develop"
+      elif [ "$CI_COMMIT_REF_NAME" = "main" ]; then
+        echo "DEPLOY_ENV=production" >> build.env
+        echo "BRANCH_NAME=main" >> build.env
+        # For production, try to get git tag, fallback to latest
+        GIT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "latest")
+        echo "IMAGE_TAG=$GIT_TAG" >> build.env
+        echo "Deploying to production environment from branch main"
+      else
+        echo "Unsupported branch: $CI_COMMIT_REF_NAME"
+        exit 1
+      fi
+  artifacts:
+    reports:
+      dotenv: build.env
+  only:
+    - develop
+    - main
+
+sonar-scanner:
+  stage: code-quality
+  image: sonarsource/sonar-scanner-cli:latest
+  script:
+    - |
+      sonar-scanner \
+        -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+        -Dsonar.sources=. \
+        -Dsonar.host.url=$HOST_SONARQUBE \
+        -Dsonar.login=$SONARQUBE_LOGIN_TOKEN
+  allow_failure: true
+  dependencies:
+    - determine-environment
+  only:
+    - develop
+    - main
+
+build-docker-image:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "🔨 Building Docker image for $DEPLOY_ENV environment..."
+    - docker build -t $REGISTRY/$IMAGE_NAME:$IMAGE_TAG .
+    - echo "✅ Build completed for $DEPLOY_ENV environment!"
+    - echo "📤 Pushing Docker image to Harbor for $DEPLOY_ENV environment..."
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USER" --password-stdin https://$REGISTRY
+    - docker push $REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+    - echo "✅ Image pushed successfully!"
+  dependencies:
+    - determine-environment
+  only:
+    - develop
+    - main
+
+deploy-development:
+  stage: deploy
+  image: 
+    name: quay.io/openshift/origin-cli:latest
+    entrypoint: [""]
+  script:
+    - echo "🚀 Deploying to development environment..."
+    - echo "🔐 Logging into OpenShift..."
+    - oc login --server=https://$OKD -u $OKD_USER -p $OKD_PASSWORD --insecure-skip-tls-verify
+    - DEPLOYMENT_FILE="deployment-dev.yaml"
+    - echo "📂 Using deployment file: $DEPLOYMENT_FILE"
+    - echo "🚀 Target Deployment: $APPS_DEV"
+    - |
+      if [ ! -f "$DEPLOYMENT_FILE" ]; then
+        echo "❌ Deployment file $DEPLOYMENT_FILE not found!"
+        exit 1
+      fi
+    - sed -i "s|${REGISTRY}/${IMAGE_NAME}:.*|${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}|g" $DEPLOYMENT_FILE
+    - echo "📂 Switching to project: $OKD_PROJECT_DEV..."
+    - oc project $OKD_PROJECT_DEV
+    - echo "📜 Applying updated deployment configuration..."
+    - oc apply -f $DEPLOYMENT_FILE -n $OKD_PROJECT_DEV
+    - echo "⏳ Waiting for rollout to complete..."
+    - oc rollout status deployment/$APPS_DEV -n $OKD_PROJECT_DEV
+    - echo "✅ Deployment successful!"
+    - oc logout
+  dependencies:
+    - determine-environment
+    - build-docker-image
+  environment:
+    name: development
+  only:
+    variables:
+      - $DEPLOY_ENV == "development"
+
+deploy-production:
+  stage: deploy
+  image: 
+    name: quay.io/openshift/origin-cli:latest
+    entrypoint: [""]
+  script:
+    - echo "🚀 Deploying to production environment..."
+    - echo "🔐 Logging into OpenShift..."
+    - oc login --server=https://$OKD -u $OKD_USER -p $OKD_PASSWORD --insecure-skip-tls-verify
+    - DEPLOYMENT_FILE="deployment-prod.yaml"
+    - echo "📂 Using deployment file: $DEPLOYMENT_FILE"
+    - echo "🚀 Target Deployment: $APPS_PROD"
+    - |
+      if [ ! -f "$DEPLOYMENT_FILE" ]; then
+        echo "❌ Deployment file $DEPLOYMENT_FILE not found!"
+        exit 1
+      fi
+    - sed -i "s|${REGISTRY}/${IMAGE_NAME}:.*|${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}|g" $DEPLOYMENT_FILE
+    - echo "📂 Switching to project: $OKD_PROJECT_PROD..."
+    - oc project $OKD_PROJECT_PROD
+    - echo "📜 Applying updated deployment configuration..."
+    - oc apply -f $DEPLOYMENT_FILE -n $OKD_PROJECT_PROD
+    - echo "⏳ Waiting for rollout to complete..."
+    - oc rollout status deployment/$APPS_PROD -n $OKD_PROJECT_PROD
+    - echo "✅ Deployment successful!"
+    - oc logout
+  dependencies:
+    - determine-environment
+    - build-docker-image
+  environment:
+    name: production
+  when: manual
+  only:
+    variables:
+      - $DEPLOY_ENV == "production"
+
+after_script:
+  - echo "🏁 Pipeline finished for $DEPLOY_ENV environment"
+  - docker images || true
+  - docker ps -a || true
+  - echo "🗑️ Removing Docker image to free up space..."
+  - docker rmi -f $REGISTRY/$IMAGE_NAME:$IMAGE_TAG || echo "⚠️ Failed to remove image, it may be in use"
+  - echo "✅ Cleanup completed!"
